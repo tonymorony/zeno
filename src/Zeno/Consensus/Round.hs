@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MonoLocalBinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RankNTypes, GADTs #-}
 
 module Zeno.Consensus.Round
   ( ConsensusException(..)
@@ -41,14 +42,59 @@ import           Zeno.Consensus.Step
 import           Zeno.Consensus.Types
 import           Zeno.Consensus.Utils
 
+import           Control.Monad.Free
+
+
+data RoundF a where
+  GetTopic     :: (Msg -> a) -> RoundF a
+  GetParams    :: (ConsensusParams -> a) -> RoundF a
+  LogSay       :: String -> RoundF a
+  WithTimeout2 :: Serializable b => Int -> Round b -> (b -> a) -> RoundF a
+  RunStep2     :: Serializable o => Msg -> Ballot o -> [Address] -> Collect o -> Int -> (StepResult o -> a) -> RoundF a
+
+instance Functor RoundF where
+  fmap f = go where
+    go (GetTopic g) = GetTopic $ f . g
+    go (GetParams g) = GetParams $ f . g
+    go (LogSay s) = LogSay s
+    go (WithTimeout2 t act g) = WithTimeout2 t act $ f . g
+    go (RunStep2 m b a c i g) = RunStep2 m b a c i $ f . g
+
+type Round = Free RoundF
+
+getTopic = liftF (GetTopic id)
+getParams = liftF (GetParams undefined)
+logSay s = liftF (LogSay s)
+withTimeout2 t act = liftF (WithTimeout2 t act undefined)
+runStep2 m b ms x i = liftF (RunStep2 m b ms x i undefined)
+
+runRoundConsensus :: forall a. Serializable a => Round a -> Consensus a
+runRoundConsensus = iterM run where
+  run :: RoundF (Consensus a) -> Consensus a
+  run (GetTopic f) = get >>= f
+  run (GetParams f) = ask >>= f
+  run (WithTimeout2 t act f) = do
+    withTimeout t $ runRoundConsensus act >>= f
+  run (RunStep2 topic ballot members collect timeout f) = do
+    r <- 
+      lift $ lift $ do
+        (send, recv) <- newChan
+        _ <- spawnLocalLink $ runStep topic ballot members $ sendChan send
+        collect recv timeout members
+    f r
+
+
+
+
+
 
 -- Run round ------------------------------------------------------------------
 
 runConsensus :: (Serializable a, Has ConsensusNode r) => ConsensusParams
-             -> a -> Consensus b -> Zeno r b
+             -> a -> Round b -> Zeno r b
 runConsensus params topicData act = do
   let topic = hashMsg $ toStrict $ Bin.encode topicData
-      act' = evalStateT (runReaderT act params) topic
+      act' = evalStateT (runReaderT (runRoundConsensus act) params) topic
   ConsensusNode node <- asks $ has
   liftIO $ do
     handoff <- newEmptyMVar
@@ -57,56 +103,54 @@ runConsensus params topicData act = do
       act' >>= putMVar handoff
     takeMVar handoff
 
+
 -- Coordinate Round -----------------------------------------------------------
 
 -- | step initiates the procedure of exchanging signed messages.
 --   The messages contain a signature which is based on 
 --   
-step' :: Serializable a => Collect a -> a -> Consensus (Inventory a)
+step' :: Serializable a => Collect a -> a -> Round (StepResult a)
 step' collect obj = do
-  topic <- get
-  ConsensusParams members (EthIdent sk myAddr) timeout <- ask
+  topic <- getTopic
+  ConsensusParams members (EthIdent sk myAddr) timeout <- getParams
   let sig = sign sk topic
   let ballot = Ballot myAddr sig obj
-  lift $ lift $ do
-    (send, recv) <- newChan
-    _ <- spawnLocalLink $ runStep topic ballot members $ sendChan send
-    collect recv timeout members
+  runStep2 topic ballot members collect timeout
 
-stepWithTopic :: Serializable a => Topic -> Collect a -> a -> Consensus (Inventory a)
-stepWithTopic topic collect o = put topic >> step' collect o
+stepWithTopic :: Serializable a => Topic -> Collect a -> a -> Round (StepResult a)
+stepWithTopic topic collect o = putTopic topic >> step' collect o
 
-step :: Serializable a => Collect a -> a -> Consensus (Inventory a)
+step :: Serializable a => Collect a -> a -> Round (StepResult a)
 step collect o = permuteTopic >> step' collect o
-
+ 
 -- 1. Determine a starting proposer
 -- 2. Try to get a proposal from them
 -- 3. If there's a timeout, move to the next proposer
-propose :: forall a. Serializable a => Consensus a -> Consensus a
-propose mObj = do
-  determineProposers >>= go
+proposeWithRound :: forall a. Serializable a => Consensus a -> Round (StepResult a)
+proposeWithRound mObj =
+  determineProposers >>= withTimeout2 (5 * 1000000) . go
     where
-      go :: [(Address, Bool)] -> Consensus a
-      go [] = throw $ ConsensusTimeout "Ran out of proposers"
-      go ((pAddr, isMe):xs) = do
-
-        let nextProposer (ConsensusTimeout _) = do
-              lift $ lift $ say $ "Timeout collecting for proposer: " ++ show pAddr
-              go xs
-            nextProposer e = throw e
-
-        obj <- if isMe then Just <$> mObj else pure Nothing
-
-        handle nextProposer $ do
-          withTimeout (5 * 1000000) $ do
-            results <- step (collectMembers [pAddr]) obj
+    go :: [(Address, Bool)] -> Round (StepResult a)
+    go [] = pure $ Left $ ConsensusTimeout "Ran out of proposers"
+    go ((pAddr, isMe):xs) = do
+      obj <- if isMe then Just <$> (undefined :: Round a) else pure Nothing
+      stepWithRound (collectMembers [pAddr]) obj >>=
+        \case
+          Right results ->
             case Map.lookup pAddr results of
-                 Just (_, Just obj2) -> pure obj2
-                 _                   -> do
-                   lift $ lift $ say $ "Mischief: missing proposal from: " ++ show pAddr
-                   throw (ConsensusMischief $ printf "Missing proposal from %s" $ show pAddr)
+                 Just (_, Just obj2) -> pure $ Right obj2
+                 _ -> pure $ Left $
+                   ConsensusMischief $ printf "Missing proposal from %s" $ show pAddr
+          Left (ConsensusTimeout _) -> do
+            logSay $ "Timeout collecting for proposer: " ++ show pAddr
+            go xs
+          Left e -> pure $ Left e
 
-determineProposers :: Consensus [(Address, Bool)]
+
+propose :: forall a. Serializable a => Consensus a -> Consensus (StepResult a)
+propose = runRoundConsensus . proposeWithRound
+
+determineProposers :: Round [(Address, Bool)]
 determineProposers = do
   {- This gives fairly good distribution:
   import hashlib
@@ -117,9 +161,9 @@ determineProposers = do
       dist[d%64] += 1
   print dist
   -}
-  ConsensusParams members (EthIdent _ myAddr)  _ <- ask
+  ConsensusParams members (EthIdent _ myAddr)  _ <- getParams
   let msg2sum = sum . map fromIntegral . BS.unpack . getMsg
-  topic <- get
+  topic <- getTopic
   let i = mod (msg2sum topic) (length members)
       proposers = take 3 $ drop i $ cycle members
   pure $ [(p, p == myAddr) | p <- proposers]
@@ -129,6 +173,7 @@ permuteTopic = do
   out <- get
   put $ hashMsg $ getMsg out
   pure out
+
 
 -- Check Majority -------------------------------------------------------------
 
@@ -152,8 +197,8 @@ collectGeneric test recv timeout members = do
     let us = max 0 $ timeout - d
     minv <- receiveChanTimeout us recv
     case minv of
-         Nothing -> throw (ConsensusTimeout "collect timeout")
-         Just inv | test members inv -> pure inv
+         Nothing -> pure $ Left (ConsensusTimeout "collect timeout")
+         Just inv | test members inv -> pure $ Right inv
          _ -> f
 
 haveMajority :: [Address] -> Inventory a -> Bool

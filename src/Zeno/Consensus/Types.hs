@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveGeneric, DeriveFunctor #-}
 
 module Zeno.Consensus.Types where
 
@@ -20,13 +20,14 @@ data Ballot a = Ballot
   { bMember :: Address
   , bSig :: CompactRecSig
   , bData :: a
-  } deriving (Show, Generic)
+  } deriving (Show, Generic, Functor)
 
 instance Binary a => Binary (Ballot a)
 
 type Authenticated a = (CompactRecSig, a)
 type Inventory a = Map Address (CompactRecSig, a)
-type Collect a = ReceivePort (Inventory a) -> Timeout -> [Address] -> Process (Inventory a)
+type StepResult o = Either ConsensusException (Inventory o)
+type Collect a = ReceivePort (Inventory a) -> Timeout -> [Address] -> Process (StepResult a)
 
 unInventory :: Inventory a -> [Ballot a]
 unInventory inv = [Ballot a s o | (a, (s, o)) <- Map.toAscList inv]
@@ -48,7 +49,8 @@ type Consensus = ReaderT ConsensusParams (StateT Topic Process)
 
 data ConsensusException = ConsensusTimeout String
                         | ConsensusMischief String
-  deriving (Show)
+  deriving (Show, Generic)
+instance Binary ConsensusException
 instance Exception ConsensusException
 
 
